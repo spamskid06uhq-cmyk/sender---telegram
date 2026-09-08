@@ -1,383 +1,478 @@
+"""
+MAIL SENDER — Bot Telegram d'envoi d'e-mails
+Architecture : machine à états manuelle (pas de ConversationHandler)
+Persistance  : SQLite (licenses.db)
+"""
 import os
 import re
-import json
+import sqlite3
+import asyncio
 import smtplib
 import logging
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+from datetime import datetime, timezone
+from email.message import EmailMessage
 from pathlib import Path
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ConversationHandler, ContextTypes, filters,
+    CallbackQueryHandler, ContextTypes, filters,
 )
 
+# ──────────────────────────────────────────────
+# LOGGING
+# ──────────────────────────────────────────────
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s [%(levelname)s] %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-# --- Config ---
-BOT_TOKEN     = os.environ["TELEGRAM_BOT_TOKEN"]
-SMTP_HOST     = os.environ.get("SMTP_HOST", "mail.gmx.net")
-SMTP_PORT     = int(os.environ.get("SMTP_PORT", "587"))
-SMTP_USER     = os.environ["SMTP_USER"]
-SMTP_PASSWORD = os.environ["SMTP_PASSWORD"]
-SECRET_CODE   = "zizi1306"
-FREE_CREDITS  = 3
-UNLIMITED     = -1
-TIMEOUT_SEC   = 60
+# ──────────────────────────────────────────────
+# CONFIG (variables d'environnement uniquement)
+# ──────────────────────────────────────────────
+BOT_TOKEN      = os.environ["TELEGRAM_BOT_TOKEN"]
+SECRET_CODE    = os.environ["SECRET_CODE"]
+EMAIL_ADDRESS  = os.environ["EMAIL_ADDRESS"]
+EMAIL_PASSWORD = os.environ["EMAIL_PASSWORD"]
+SMTP_HOST      = os.environ.get("SMTP_HOST", "mail.gmx.net")
+SMTP_PORT      = int(os.environ.get("SMTP_PORT", "587"))
+TIMEOUT_SEC    = 60
 
-CREDITS_FILE = Path("credits.json")
+# ──────────────────────────────────────────────
+# BASE DE DONNÉES
+# ──────────────────────────────────────────────
+DB_PATH = Path("licenses.db")
 
-# Contacts pré-enregistrés depuis l'env : "Alice:alice@gmail.com,Bob:bob@mail.fr"
-def parse_contacts() -> list:
-    raw = os.environ.get("CONTACTS", "")
-    result = []
-    for entry in raw.split(","):
-        entry = entry.strip()
-        if ":" in entry:
-            name, email = entry.split(":", 1)
-            result.append((name.strip(), email.strip()))
-    return result
+def init_db() -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS licenses (
+                telegram_user_id INTEGER PRIMARY KEY,
+                activated_at     TEXT    NOT NULL,
+                active           INTEGER NOT NULL DEFAULT 1
+            )
+        """)
+    logger.info("DB initialisée.")
 
-CONTACTS = parse_contacts()
+def is_licensed(user_id: int) -> bool:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM licenses WHERE telegram_user_id = ? AND active = 1",
+            (user_id,)
+        ).fetchone()
+    return row is not None
 
-# --- Crédits ---
-def load_credits() -> dict:
-    if CREDITS_FILE.exists():
-        return json.loads(CREDITS_FILE.read_text())
-    return {}
+def grant_license(user_id: int) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            INSERT INTO licenses (telegram_user_id, activated_at, active)
+            VALUES (?, ?, 1)
+            ON CONFLICT(telegram_user_id)
+            DO UPDATE SET active = 1, activated_at = excluded.activated_at
+        """, (user_id, now))
+    logger.info(f"Licence accordée → user_id={user_id}")
 
-def save_credits(data: dict) -> None:
-    CREDITS_FILE.write_text(json.dumps(data))
+# ──────────────────────────────────────────────
+# ÉTATS (machine à états par utilisateur)
+# ──────────────────────────────────────────────
+IDLE              = "IDLE"
+WAITING_LICENSE   = "WAITING_LICENSE"
+EMAIL_MENU        = "EMAIL_MENU"
+WAITING_RECIPIENT = "WAITING_RECIPIENT"
+WAITING_SUBJECT   = "WAITING_SUBJECT"
+WAITING_BODY      = "WAITING_BODY"
 
-def get_credits(uid: str) -> int:
-    return load_credits().get(uid, FREE_CREDITS)
-
-def set_credits(uid: str, value: int) -> None:
-    data = load_credits()
-    data[uid] = value
-    save_credits(data)
-
-def use_credit(uid: str) -> bool:
-    c = get_credits(uid)
-    if c == UNLIMITED:
-        return True
-    if c <= 0:
-        return False
-    set_credits(uid, c - 1)
-    return True
-
-def credits_label(uid: str) -> str:
-    c = get_credits(uid)
-    return "Illimité" if c == UNLIMITED else str(c)
-
-# --- States ---
-MENU, RCPT_CHOICE, RCPT_INPUT, SUBJECT, MESSAGE, CONFIRM, CODE_INPUT = range(7)
+user_states  : dict[int, str]  = {}
+user_drafts  : dict[int, dict] = {}
+user_timers  : dict[int, asyncio.Task] = {}
+user_sessions: dict[int, bool] = {}  # True = déverrouillé
 
 EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
-# --- Claviers ---
-def main_menu_kb(uid: str) -> InlineKeyboardMarkup:
+# ──────────────────────────────────────────────
+# CLAVIERS
+# ──────────────────────────────────────────────
+MAIN_MENU_KB = InlineKeyboardMarkup([
+    [InlineKeyboardButton("📧 Envoyer un e-mail", callback_data="m:email")],
+    [
+        InlineKeyboardButton("📋 Mes contacts",  callback_data="m:contacts"),
+        InlineKeyboardButton("⚙️ Paramètres",    callback_data="m:settings"),
+    ],
+    [InlineKeyboardButton("🔒 Verrouiller", callback_data="m:lock")],
+])
+
+def email_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📨 Destinataire", callback_data="e:recipient")],
+        [InlineKeyboardButton("📝 Objet",        callback_data="e:subject")],
+        [InlineKeyboardButton("💬 Message",      callback_data="e:body")],
         [
-            InlineKeyboardButton("📧 Envoyer mail", callback_data="menu:email"),
-            InlineKeyboardButton("🔑 Activer licence", callback_data="menu:code"),
-        ],
-        [
-            InlineKeyboardButton(f"💳 Crédits : {credits_label(uid)}", callback_data="menu:credits"),
-            InlineKeyboardButton("ℹ️ Aide", callback_data="menu:help"),
+            InlineKeyboardButton("📤 Envoyer",  callback_data="e:send"),
+            InlineKeyboardButton("❌ Annuler",  callback_data="e:cancel"),
         ],
     ])
 
-def recipient_kb() -> InlineKeyboardMarkup:
-    rows = []
-    for name, email in CONTACTS:
-        rows.append([InlineKeyboardButton(f"👤 {name}", callback_data=f"rcpt:{email}:{name}")])
-    rows.append([InlineKeyboardButton("✏️ Entrer une adresse", callback_data="rcpt:custom")])
-    rows.append([InlineKeyboardButton("❌ Annuler", callback_data="rcpt:cancel")])
-    return InlineKeyboardMarkup(rows)
+def email_menu_text(user_id: int) -> str:
+    draft = user_drafts.get(user_id, {})
+    rcpt  = draft.get("recipient") or "Non renseigné"
+    subj  = draft.get("subject")   or "Non renseigné"
+    body  = draft.get("body")      or "Non renseigné"
+    secs  = draft.get("secs_left", TIMEOUT_SEC)
+    return (
+        "📧 ENVOI D'UN E-MAIL\n\n"
+        f"⏱️ Temps restant : {secs} sec\n\n"
+        f"📨 Destinataire :\n{rcpt}\n\n"
+        f"📝 Objet :\n{subj}\n\n"
+        f"💬 Message :\n{body}"
+    )
 
-def step_kb(step: str) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton("⏭️ Passer", callback_data=f"skip:{step}")]]
-    if step == "message":
-        rows.insert(0, [InlineKeyboardButton("✅ Envoyer maintenant", callback_data="skip:send_now")])
-    rows.append([InlineKeyboardButton("❌ Annuler", callback_data="skip:cancel")])
-    return InlineKeyboardMarkup(rows)
-
-CONFIRM_KB = InlineKeyboardMarkup([
-    [InlineKeyboardButton("✅ Envoyer", callback_data="confirm:send")],
-    [InlineKeyboardButton("❌ Annuler", callback_data="confirm:cancel")],
+AFTER_SEND_KB = InlineKeyboardMarkup([
+    [
+        InlineKeyboardButton("📧 Nouvel e-mail", callback_data="m:email"),
+        InlineKeyboardButton("🏠 Menu",          callback_data="m:home"),
+    ],
 ])
 
-# --- Timer ---
-async def timeout_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
-    await context.bot.send_message(
-        context.job.chat_id,
-        "⏱️ Délai de 60 secondes expiré. Email annulé.\n\nUtilise /start pour recommencer.",
-    )
+TIMEOUT_KB = InlineKeyboardMarkup([
+    [InlineKeyboardButton("🏠 Menu", callback_data="m:home")],
+])
 
-def start_timer(context: ContextTypes.DEFAULT_TYPE, chat_id: int, uid: int) -> None:
-    stop_timer(context)
-    job = context.job_queue.run_once(
-        timeout_callback, TIMEOUT_SEC, chat_id=chat_id, name=f"t_{uid}"
-    )
-    context.user_data["_job"] = job
-
-def stop_timer(context: ContextTypes.DEFAULT_TYPE) -> None:
-    job = context.user_data.pop("_job", None)
-    if job:
-        job.schedule_removal()
-
-# --- Menu principal ---
-async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = "Que veux-tu faire ?") -> int:
-    stop_timer(context)
-    uid = str(update.effective_user.id)
-    kb = main_menu_kb(uid)
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=kb)
-    else:
-        await update.effective_message.reply_text(text, reply_markup=kb)
-    return MENU
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.clear()
-    uid = str(update.effective_user.id)
-    if uid not in load_credits():
-        set_credits(uid, FREE_CREDITS)
-    return await show_menu(update, context, "Bienvenue ! Que veux-tu faire ?")
-
-async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
-    uid = str(update.effective_user.id)
-
-    if q.data == "menu:email":
-        if get_credits(uid) == 0:
-            await q.edit_message_text("Tu n'as plus de crédits. Active une licence 🔑.", reply_markup=main_menu_kb(uid))
-            return MENU
-        await q.edit_message_text("📧 Choisis un destinataire :", reply_markup=recipient_kb())
-        return RCPT_CHOICE
-
-    if q.data == "menu:code":
-        await q.edit_message_text("🔑 Entre ton code de licence :")
-        return CODE_INPUT
-
-    if q.data == "menu:credits":
-        await q.answer(f"Crédits restants : {credits_label(uid)}", show_alert=True)
-        return MENU
-
-    if q.data == "menu:help":
-        await q.edit_message_text(
-            f"ℹ️ Aide\n\n{FREE_CREDITS} emails gratuits à l'inscription.\n"
-            "Code licence = envois illimités.\n"
-            f"Chaque email a un délai de {TIMEOUT_SEC}s.",
-            reply_markup=main_menu_kb(uid),
-        )
-        return MENU
-
-    return MENU
-
-# --- Destinataire ---
-async def rcpt_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
-
-    if q.data == "rcpt:cancel":
-        return await show_menu(update, context, "Annulé.")
-
-    if q.data == "rcpt:custom":
-        await q.edit_message_text("✏️ Entre l'adresse email du destinataire :")
-        return RCPT_INPUT
-
-    parts = q.data.split(":", 2)
-    if len(parts) == 3:
-        email = parts[1]
-        name = parts[2]
-        context.user_data["rcpt"] = email
-        start_timer(context, update.effective_chat.id, update.effective_user.id)
-        await q.edit_message_text(
-            f"📧 Destinataire : {name} <{email}>\n"
-            f"⏱️ {TIMEOUT_SEC}s pour envoyer.\n\n"
-            "Objet ? (optionnel)",
-            reply_markup=step_kb("subject"),
-        )
-        return SUBJECT
-
-    return RCPT_CHOICE
-
-async def rcpt_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    email = update.message.text.strip()
-    if not EMAIL_REGEX.match(email):
-        await update.message.reply_text("Adresse invalide. Réessaie ou /annuler.")
-        return RCPT_INPUT
-    context.user_data["rcpt"] = email
-    start_timer(context, update.effective_chat.id, update.effective_user.id)
-    await update.message.reply_text(
-        f"📧 Destinataire : {email}\n"
-        f"⏱️ {TIMEOUT_SEC}s pour envoyer.\n\n"
-        "Objet ? (optionnel)",
-        reply_markup=step_kb("subject"),
-    )
-    return SUBJECT
-
-# --- Objet ---
-async def subject_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
-    if q.data == "skip:cancel":
-        return await show_menu(update, context, "Annulé.")
-    context.user_data.setdefault("subject", "")
-    await q.edit_message_text(
-        f"📧 {context.user_data['rcpt']}\n"
-        f"📋 Objet : {context.user_data['subject'] or '(aucun)'}\n"
-        f"⏱️ {TIMEOUT_SEC}s\n\n"
-        "Message ? (optionnel)",
-        reply_markup=step_kb("message"),
-    )
-    return MESSAGE
-
-async def subject_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["subject"] = update.message.text.strip()
-    await update.message.reply_text(
-        f"📧 {context.user_data['rcpt']}\n"
-        f"📋 Objet : {context.user_data['subject']}\n"
-        f"⏱️ {TIMEOUT_SEC}s\n\n"
-        "Message ? (optionnel)",
-        reply_markup=step_kb("message"),
-    )
-    return MESSAGE
-
-# --- Message ---
-async def message_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
-    if q.data == "skip:cancel":
-        return await show_menu(update, context, "Annulé.")
-    context.user_data.setdefault("body", "")
-    if q.data == "skip:send_now":
-        return await do_send(update, context)
-    return await show_confirm(update, context)
-
-async def message_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["body"] = update.message.text.strip()
-    return await show_confirm(update, context)
-
-# --- Confirmation ---
-async def show_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    rcpt = context.user_data.get("rcpt", "")
-    subj = context.user_data.get("subject") or "(aucun)"
-    body = context.user_data.get("body") or "(aucun)"
-    text = f"📧 {rcpt}\n📋 {subj}\n💬 {body}\n\nEnvoyer ?"
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=CONFIRM_KB)
-    else:
-        await update.effective_message.reply_text(text, reply_markup=CONFIRM_KB)
-    return CONFIRM
-
-async def confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
-    if q.data == "confirm:send":
-        return await do_send(update, context)
-    return await show_menu(update, context, "Annulé.")
-
-# --- Envoi ---
-async def do_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    stop_timer(context)
-    uid = str(update.effective_user.id)
-
-    if not use_credit(uid):
-        msg = "Plus de crédits. Active une licence 🔑."
-        if update.callback_query:
-            await update.callback_query.edit_message_text(msg)
-        else:
-            await update.effective_message.reply_text(msg)
-        return await show_menu(update, context)
-
-    rcpt = context.user_data.get("rcpt", "")
-    subj = context.user_data.get("subject", "") or "(sans objet)"
-    body = context.user_data.get("body", "") or "(sans message)"
-
+# ──────────────────────────────────────────────
+# TIMER
+# ──────────────────────────────────────────────
+async def _run_timer(bot, chat_id: int, user_id: int, msg_id: int) -> None:
     try:
-        _send_email(rcpt, subj, body)
-        result = f"✅ Email envoyé à {rcpt}."
-    except Exception as exc:
-        logger.exception("Échec envoi")
-        result = f"❌ Échec : {exc}"
+        for remaining in range(TIMEOUT_SEC, 0, -1):
+            await asyncio.sleep(1)
+            if user_states.get(user_id) not in (EMAIL_MENU, WAITING_RECIPIENT, WAITING_SUBJECT, WAITING_BODY):
+                return
+            if user_id in user_drafts:
+                user_drafts[user_id]["secs_left"] = remaining - 1
 
-    if update.callback_query:
-        await update.callback_query.edit_message_text(result)
+        # Timeout atteint
+        user_states.pop(user_id, None)
+        user_drafts.pop(user_id, None)
+        user_timers.pop(user_id, None)
+        logger.info(f"Timeout email → user_id={user_id}")
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg_id,
+                text="⏰ Temps écoulé.",
+                reply_markup=TIMEOUT_KB,
+            )
+        except Exception:
+            await bot.send_message(chat_id, "⏰ Temps écoulé.", reply_markup=TIMEOUT_KB)
+    except asyncio.CancelledError:
+        pass
+
+def start_timer(bot, chat_id: int, user_id: int, msg_id: int) -> None:
+    stop_timer(user_id)
+    task = asyncio.create_task(_run_timer(bot, chat_id, user_id, msg_id))
+    user_timers[user_id] = task
+
+def stop_timer(user_id: int) -> None:
+    task = user_timers.pop(user_id, None)
+    if task and not task.done():
+        task.cancel()
+
+# ──────────────────────────────────────────────
+# HELPERS
+# ──────────────────────────────────────────────
+async def send_main_menu(bot, chat_id: int, edit_msg_id: int = None) -> None:
+    text = "✉️ MAIL SENDER\n\nQue veux-tu faire ?"
+    if edit_msg_id:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=edit_msg_id,
+                text=text, reply_markup=MAIN_MENU_KB,
+            )
+            return
+        except Exception:
+            pass
+    await bot.send_message(chat_id, text, reply_markup=MAIN_MENU_KB)
+
+async def refresh_email_menu(bot, chat_id: int, user_id: int) -> None:
+    draft  = user_drafts.get(user_id, {})
+    msg_id = draft.get("msg_id")
+    text   = email_menu_text(user_id)
+    kb     = email_menu_kb()
+    if msg_id:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=msg_id,
+                text=text, reply_markup=kb,
+            )
+            return
+        except Exception:
+            pass
+    sent = await bot.send_message(chat_id, text, reply_markup=kb)
+    if user_id in user_drafts:
+        user_drafts[user_id]["msg_id"] = sent.message_id
+
+def require_session(user_id: int) -> bool:
+    return is_licensed(user_id) and user_sessions.get(user_id, False)
+
+# ──────────────────────────────────────────────
+# HANDLERS — COMMANDES
+# ──────────────────────────────────────────────
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+
+    if is_licensed(user_id):
+        user_sessions[user_id] = True
+        user_states[user_id]   = IDLE
+        stop_timer(user_id)
+        user_drafts.pop(user_id, None)
+        logger.info(f"/start — utilisateur autorisé user_id={user_id}")
+        await send_main_menu(context.bot, chat_id)
     else:
-        await update.effective_message.reply_text(result)
+        user_states[user_id] = WAITING_LICENSE
+        logger.info(f"/start — licence requise user_id={user_id}")
+        await update.message.reply_text(
+            "🔐 LICENCE REQUISE\n\nEntre ton code d'activation :"
+        )
 
-    context.user_data.clear()
-    return await show_menu(update, context)
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    stop_timer(user_id)
+    draft  = user_drafts.pop(user_id, {})
+    msg_id = draft.get("msg_id")
+    user_states[user_id] = IDLE
+    logger.info(f"/cancel — user_id={user_id}")
+    await send_main_menu(context.bot, chat_id, msg_id)
 
-# --- Code licence ---
-async def code_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    uid = str(update.effective_user.id)
-    if update.message.text.strip() == SECRET_CODE:
-        set_credits(uid, UNLIMITED)
-        await update.message.reply_text("✅ Licence activée. Envois illimités.")
-    else:
-        await update.message.reply_text("❌ Code invalide.")
-    return await show_menu(update, context)
+# ──────────────────────────────────────────────
+# HANDLERS — MESSAGES TEXTE
+# ──────────────────────────────────────────────
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    text    = update.message.text.strip()
+    state   = user_states.get(user_id, IDLE)
 
-# --- Annuler ---
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    stop_timer(context)
-    context.user_data.clear()
-    return await show_menu(update, context, "Annulé.")
+    # Supprimer le message utilisateur (interface propre)
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
 
-# --- SMTP ---
-def _send_email(to_addr: str, subject: str, body: str) -> None:
-    msg = MIMEMultipart()
-    msg["From"]    = SMTP_USER
+    # ── Activation de licence ──
+    if state == WAITING_LICENSE:
+        if text == SECRET_CODE:
+            grant_license(user_id)
+            user_sessions[user_id] = True
+            user_states[user_id]   = IDLE
+            await context.bot.send_message(chat_id, "✅ Licence activée !")
+            await send_main_menu(context.bot, chat_id)
+        else:
+            await context.bot.send_message(
+                chat_id,
+                "❌ Code invalide.\n\nEntre ton code d'activation :"
+            )
+        return
+
+    # ── Vérification session ──
+    if not require_session(user_id):
+        await context.bot.send_message(chat_id, "🔐 Session expirée. Utilise /start.")
+        return
+
+    # ── Destinataire ──
+    if state == WAITING_RECIPIENT:
+        if not EMAIL_REGEX.match(text):
+            await context.bot.send_message(chat_id, "❌ Adresse invalide. Réessaie.")
+            return
+        user_drafts[user_id]["recipient"] = text
+        user_states[user_id] = EMAIL_MENU
+        logger.info(f"Destinataire enregistré — user_id={user_id} → {text}")
+        await refresh_email_menu(context.bot, chat_id, user_id)
+        return
+
+    # ── Objet ──
+    if state == WAITING_SUBJECT:
+        user_drafts[user_id]["subject"] = text
+        user_states[user_id] = EMAIL_MENU
+        logger.info(f"Objet enregistré — user_id={user_id}")
+        await refresh_email_menu(context.bot, chat_id, user_id)
+        return
+
+    # ── Corps du message ──
+    if state == WAITING_BODY:
+        user_drafts[user_id]["body"] = text
+        user_states[user_id] = EMAIL_MENU
+        logger.info(f"Corps enregistré — user_id={user_id}")
+        await refresh_email_menu(context.bot, chat_id, user_id)
+        return
+
+# ──────────────────────────────────────────────
+# HANDLERS — CALLBACKS
+# ──────────────────────────────────────────────
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query   = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    data    = query.data
+    msg_id  = query.message.message_id
+
+    # ── Navigation principale ──
+    if data in ("m:home", "m:menu"):
+        stop_timer(user_id)
+        user_drafts.pop(user_id, None)
+        user_states[user_id] = IDLE
+        await send_main_menu(context.bot, chat_id, msg_id)
+        return
+
+    if data == "m:lock":
+        stop_timer(user_id)
+        user_drafts.pop(user_id, None)
+        user_sessions[user_id] = False
+        user_states[user_id]   = IDLE
+        logger.info(f"Session verrouillée — user_id={user_id}")
+        await query.edit_message_text(
+            "🔒 Session verrouillée.\n\nUtilise /start pour déverrouiller."
+        )
+        return
+
+    if data == "m:contacts":
+        await query.answer("📋 Fonctionnalité à venir.", show_alert=True)
+        return
+
+    if data == "m:settings":
+        await query.answer("⚙️ Fonctionnalité à venir.", show_alert=True)
+        return
+
+    # ── Vérification session avant actions e-mail ──
+    if not require_session(user_id):
+        await query.answer("🔐 Session expirée. Utilise /start.", show_alert=True)
+        return
+
+    # ── Ouvrir le menu e-mail ──
+    if data == "m:email":
+        user_drafts[user_id] = {
+            "recipient": "",
+            "subject":   "",
+            "body":      "",
+            "msg_id":    msg_id,
+            "secs_left": TIMEOUT_SEC,
+        }
+        user_states[user_id] = EMAIL_MENU
+        start_timer(context.bot, chat_id, user_id, msg_id)
+        await refresh_email_menu(context.bot, chat_id, user_id)
+        return
+
+    # ── Actions dans le menu e-mail ──
+    if data == "e:recipient":
+        user_states[user_id] = WAITING_RECIPIENT
+        await context.bot.send_message(chat_id, "📨 Entrez l'adresse e-mail :")
+        return
+
+    if data == "e:subject":
+        user_states[user_id] = WAITING_SUBJECT
+        await context.bot.send_message(chat_id, "📝 Entrez l'objet :")
+        return
+
+    if data == "e:body":
+        user_states[user_id] = WAITING_BODY
+        await context.bot.send_message(chat_id, "💬 Entrez votre message :")
+        return
+
+    if data == "e:cancel":
+        stop_timer(user_id)
+        user_drafts.pop(user_id, None)
+        user_states[user_id] = IDLE
+        await send_main_menu(context.bot, chat_id, msg_id)
+        return
+
+    if data == "e:send":
+        draft     = user_drafts.get(user_id, {})
+        recipient = draft.get("recipient", "").strip()
+
+        if not recipient:
+            await query.answer("❌ Destinataire manquant.", show_alert=True)
+            return
+
+        subject = draft.get("subject", "").strip() or "(sans objet)"
+        body    = draft.get("body",    "").strip() or "(sans message)"
+
+        stop_timer(user_id)
+
+        try:
+            await query.edit_message_text("📤 Envoi en cours...")
+        except Exception:
+            pass
+
+        try:
+            await asyncio.get_event_loop().run_in_executor(
+                None, _send_smtp, recipient, subject, body
+            )
+            logger.info(f"E-mail envoyé → {recipient} (user_id={user_id})")
+            user_states[user_id] = IDLE
+            user_drafts.pop(user_id, None)
+            await query.edit_message_text(
+                f"✅ E-mail envoyé !\n\n📨 {recipient}",
+                reply_markup=AFTER_SEND_KB,
+            )
+        except Exception as exc:
+            logger.error(f"Échec SMTP user_id={user_id} : {exc}")
+            await query.edit_message_text(
+                f"❌ Échec de l'envoi.\n\nErreur : {type(exc).__name__}: {exc}",
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("🔄 Réessayer", callback_data="e:send"),
+                        InlineKeyboardButton("❌ Annuler",   callback_data="e:cancel"),
+                    ],
+                ]),
+            )
+        return
+
+# ──────────────────────────────────────────────
+# SMTP
+# ──────────────────────────────────────────────
+def _send_smtp(to_addr: str, subject: str, body: str) -> None:
+    logger.info(f"SMTP connect → {SMTP_HOST}:{SMTP_PORT}")
+    msg = EmailMessage()
+    msg["From"]    = EMAIL_ADDRESS
     msg["To"]      = to_addr
     msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+    msg.set_content(body, charset="utf-8")
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as s:
         s.ehlo()
         s.starttls()
         s.ehlo()
-        s.login(SMTP_USER, SMTP_PASSWORD)
-        s.sendmail(SMTP_USER, [to_addr], msg.as_string())
+        s.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+        s.send_message(msg)
+    logger.info(f"SMTP envoi OK → {to_addr}")
 
+# ──────────────────────────────────────────────
+# DÉMARRAGE
+# ──────────────────────────────────────────────
 async def post_init(app: Application) -> None:
     await app.bot.set_my_commands([
-        BotCommand("start",   "Ouvrir le menu"),
-        BotCommand("annuler", "Annuler"),
+        BotCommand("start",  "Démarrer / Se connecter"),
+        BotCommand("cancel", "Annuler l'opération en cours"),
     ])
 
 def main() -> None:
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            MENU:       [CallbackQueryHandler(menu_cb, pattern="^menu:")],
-            RCPT_CHOICE:[CallbackQueryHandler(rcpt_cb, pattern="^rcpt:")],
-            RCPT_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, rcpt_text)],
-            SUBJECT:    [
-                CallbackQueryHandler(subject_cb, pattern="^skip:"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, subject_text),
-            ],
-            MESSAGE:    [
-                CallbackQueryHandler(message_cb, pattern="^skip:"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, message_text),
-            ],
-            CONFIRM:    [CallbackQueryHandler(confirm_cb, pattern="^confirm:")],
-            CODE_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, code_text)],
-        },
-        fallbacks=[CommandHandler("annuler", cancel)],
+    init_db()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
     )
-
-    app.add_handler(conv)
+    app.add_handler(CommandHandler("start",  cmd_start))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    logger.info("Bot démarré.")
     app.run_polling()
 
 if __name__ == "__main__":
     main()
+
